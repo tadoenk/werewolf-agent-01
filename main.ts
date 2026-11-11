@@ -11,11 +11,17 @@
 //   werewolf: kill the most dangerous villager (a seer claim first, then
 //     accusers of me or my partner, then vocal players); as the second wolf
 //     match the partner's pick so a kill happens. By day, accuse a villager
-//     and vote with the village's suspicion to blend in.
+//     and vote with the village's suspicion to blend in. Every accusation
+//     is grounded in the public record: the "voted for a villager" line is
+//     only used when the target really did that, so the village cannot
+//     catch the claim as a lie.
 //   seer: inspect the most suspicious seat; when an inspection finds a
 //     werewolf, say so in the debate and vote them out.
-//   doctor: protect the most likely night-kill target (a revealed seer
-//     first), never the same seat two nights running, never myself.
+//   doctor: protect the most likely night-kill target: a revealed seer
+//     first, then the villager who accused a revealed wolf the most (the
+//     wolves kill those who threaten them), then the most talkative.
+//     Never the same seat two nights running, never myself (the env never
+//     offers my own seat as a protect option).
 //   villager: vote the most suspicious seat and say why.
 //
 // The run loop is the starter's: POST /observe, answer every pending
@@ -331,6 +337,33 @@ function livingSeerClaim(st: GameState): Seat | null {
   return null;
 }
 
+/** Did a seat ever vote for a seat that turned out to be a villager, seer or doctor? */
+function votedForVillager(st: GameState, seat: Seat): boolean {
+  for (const day of st.votesByDay.values()) {
+    const target = day.get(seat);
+    if (target !== null && target !== undefined) {
+      const role = st.deadRole.get(target);
+      if (role === 'villager' || role === 'seer' || role === 'doctor') return true;
+    }
+  }
+  return false;
+}
+
+/** How many times a seat accused a seat that turned out to be a werewolf. */
+function wolfAccusations(st: GameState, seat: Seat): number {
+  let n = 0;
+  for (const day of st.speechesByDay.values()) {
+    for (const text of day.get(seat) ?? []) {
+      const low = text.toLowerCase();
+      if (!/\b(suspect|wolf|werewolf|vote|exile)\b/.test(low)) continue;
+      for (const m of low.matchAll(/seat\s*(\d+)/g)) {
+        if (st.deadRole.get(Number(m[1])) === 'werewolf') n += 1;
+      }
+    }
+  }
+  return n;
+}
+
 /** A seat that accused me or my partner in a speech. */
 function accusersOf(st: GameState, target: Seat): Seat[] {
   const out: Seat[] = [];
@@ -371,12 +404,26 @@ function decideKill(st: GameState, options: Seat[]): Seat | null {
 }
 
 function decideProtect(st: GameState, options: Seat[]): Seat | null {
-  // Protect a revealed seer first (they guide the village), then the most
+  // Protect a revealed seer first (they guide the village), then the
+  // villager the wolves most want dead: whoever accused a revealed wolf
+  // the most (the wolves kill those who threaten them). Then the most
   // talkative villager. Never the same seat as last night, never myself.
+  // (The env never offers my own seat as a protect option, so self-protect
+  // is not possible at all.)
   const allowed = options.filter((s) => s !== st.lastProtectSeat && s !== st.me);
   if (allowed.length === 0) return null;
   const seerClaim = livingSeerClaim(st);
   if (seerClaim !== null && allowed.includes(seerClaim)) return seerClaim;
+  let best: Seat | null = null;
+  let bestN = 0;
+  for (const s of allowed) {
+    const n = wolfAccusations(st, s);
+    if (n > bestN) {
+      bestN = n;
+      best = s;
+    }
+  }
+  if (best !== null) return best;
   const talkative = mostTalkative(st, new Set([st.me]));
   if (talkative !== null && allowed.includes(talkative)) return talkative;
   return allowed[0];
@@ -415,15 +462,22 @@ function decideSpeak(st: GameState, maxChars: number, rng: () => number): string
   const name = (seat: Seat): string => `seat ${seat}`;
   if (st.myRole === 'werewolf') {
     // Accuse the most suspicious villager, keep it short and plausible.
+    // Only make a claim the record supports: the "voted for a villager"
+    // line needs the target to have actually done that, and the "quiet"
+    // line needs the target to have barely spoken. An ungrounded claim is
+    // a tell the village can check against the public log.
     const exclude = new Set<Seat>(st.partner !== null ? [st.partner] : []);
     const ranked = rankedSuspects(st, exclude, rng);
     const target = ranked.find((s) => st.alive.includes(s));
     if (target === undefined) return null;
-    const lines = [
-      `${name(target)} voted for a villager yesterday and keeps deflecting. I think ${name(target)} is a wolf.`,
-      `Watch ${name(target)}: their votes do not add up. I suspect ${name(target)}.`,
-      `${name(target)} has been quiet when it mattered and pointed at villagers. My vote is ${name(target)}.`,
-    ];
+    const lines: string[] = [];
+    if (votedForVillager(st, target)) {
+      lines.push(`${name(target)} voted for a villager yesterday and keeps deflecting. I think ${name(target)} is a wolf.`);
+    }
+    if (speechStats(st, target).count <= 1) {
+      lines.push(`${name(target)} has been quiet when it mattered and pointed at villagers. My vote is ${name(target)}.`);
+    }
+    lines.push(`Watch ${name(target)}: their votes do not add up. I suspect ${name(target)}.`);
     return cutStatement(lines[Math.floor(rng() * lines.length)], maxChars);
   }
   if (st.myRole === 'seer' && st.myWolfFinds.size > 0) {
@@ -440,12 +494,13 @@ function decideSpeak(st: GameState, maxChars: number, rng: () => number): string
     // Another seer claim exists; stay quiet about my own role for now.
   }
   // Village side (villager, doctor, or seer without a find): accuse the
-  // most suspicious seat and give a reason.
+  // most suspicious seat and give a reason. The vote-based reason is only
+  // used when the target really did vote for a revealed villager.
   const ranked = rankedSuspects(st, new Set(), rng);
   const target = ranked.find((s) => st.alive.includes(s));
   if (target === undefined) return null;
   const reason =
-    st.deadRole.size > 0
+    votedForVillager(st, target)
       ? `${name(target)} voted against villagers who turned out innocent.`
       : `${name(target)} has been deflecting instead of helping find the wolves.`;
   return cutStatement(`I suspect ${name(target)}: ${reason} My vote is ${name(target)}.`, maxChars);
